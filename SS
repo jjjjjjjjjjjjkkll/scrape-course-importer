@@ -1,0 +1,758 @@
+<?php
+/*
+Plugin Name: Scrape Course Importer
+Description: Import courses (title, description, cover image) from your own site category pages. Defensive, batchable, configurable CSS selectors and WP-CLI support.
+Version: 1.0.0
+Author: Copilot
+*/
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Basic constants
+ */
+define('SCI_PLUGIN_VERSION', '1.0.0');
+define('SCI_META_SOURCE_URL', '_sci_source_url');
+
+/**
+ * Register CPT 'course'
+ */
+add_action('init', 'sci_register_course_post_type');
+function sci_register_course_post_type() {
+    if (post_type_exists('course')) {
+        return;
+    }
+
+    register_post_type('course', array(
+        'labels' => array(
+            'name' => __('Cursos', 'sci'),
+            'singular_name' => __('Curso', 'sci'),
+            'add_new_item' => __('Adicionar novo curso', 'sci'),
+            'edit_item' => __('Editar curso', 'sci'),
+        ),
+        'public' => true,
+        'has_archive' => true,
+        'supports' => array('title', 'editor', 'excerpt', 'thumbnail'),
+        'menu_icon' => 'dashicons-welcome-learn-more',
+        'show_in_rest' => true,
+    ));
+
+    register_taxonomy_if_not_exists('course_category', array('course'));
+}
+
+/**
+ * Helper: register taxonomy if not exists
+ */
+function register_taxonomy_if_not_exists($taxonomy, $object_type = array('course')) {
+    if (!taxonomy_exists($taxonomy)) {
+        register_taxonomy($taxonomy, $object_type, array(
+            'labels' => array(
+                'name' => __('Categorias de Cursos', 'sci'),
+                'singular_name' => __('Categoria', 'sci'),
+            ),
+            'hierarchical' => true,
+            'show_ui' => true,
+            'show_admin_column' => true,
+            'show_in_rest' => true,
+        ));
+    }
+}
+
+/**
+ * Admin menu
+ */
+add_action('admin_menu', 'sci_register_admin_menu');
+function sci_register_admin_menu() {
+    add_menu_page(
+        __('Importador de Cursos', 'sci'),
+        __('Cursos', 'sci'),
+        'manage_options',
+        'sci-course-importer',
+        'sci_render_admin_page',
+        'dashicons-upload',
+        26
+    );
+}
+
+/**
+ * Render admin page
+ */
+function sci_render_admin_page() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+
+    $defaults = array(
+        'item_selector' => '.post, .entry, article',
+        'title_selector' => '.entry-title a, h2 a, h2',
+        'excerpt_selector' => '.entry-summary, .entry-excerpt, .excerpt',
+        'image_selector' => '.post-thumbnail img, img',
+        'link_selector' => 'a',
+        'next_page_selector' => '.nav-next a, a.next, .pagination a.next',
+        'batch' => 20,
+        'throttle' => 500, // ms
+    );
+
+    // Handle posted settings (we won't persist permanently; form-only)
+    $values = array();
+    foreach ($defaults as $k => $v) {
+        $values[$k] = isset($_POST[$k]) ? sanitize_text_field(wp_unslash($_POST[$k])) : $v;
+    }
+
+    $notice = '';
+    if (!empty($_GET['sci_status'])) {
+        $status = sanitize_text_field(wp_unslash($_GET['sci_status']));
+        $notice = '<div class="notice notice-success is-dismissible"><p>' . esc_html($status) . '</p></div>';
+    }
+
+    ?>
+    <div class="wrap">
+        <h1><?php esc_html_e('Importador de Cursos', 'sci'); ?></h1>
+        <?php echo $notice; ?>
+
+        <p><?php esc_html_e('Cole a URL da categoria do seu site (página pública). Ajuste seletores se necessário e faça um dry-run antes de importar.', 'sci'); ?></p>
+
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+            <?php wp_nonce_field('sci_import_courses_nonce', 'sci_import_courses_nonce'); ?>
+            <input type="hidden" name="action" value="sci_import_courses">
+
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><label for="sci_source_url"><?php esc_html_e('URL da categoria', 'sci'); ?></label></th>
+                    <td>
+                        <input type="url" id="sci_source_url" name="sci_source_url" class="regular-text" required placeholder="https://seu-site.org/categoria/..." />
+                        <p class="description"><?php esc_html_e('URL pública da categoria que contém os cursos.', 'sci'); ?></p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_item_selector">Item selector (CSS)</label></th>
+                    <td>
+                        <input type="text" id="sci_item_selector" name="item_selector" class="regular-text" value="<?php echo esc_attr($values['item_selector']); ?>" />
+                        <p class="description">Seletor CSS que identifica cada item do loop de cursos. (ex: <code>.post</code> ou <code>article</code>)</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_title_selector">Title selector (CSS)</label></th>
+                    <td>
+                        <input type="text" id="sci_title_selector" name="title_selector" class="regular-text" value="<?php echo esc_attr($values['title_selector']); ?>" />
+                        <p class="description">Seletor relativo ao item que aponta para o título (ex: <code>.entry-title a</code>).</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_excerpt_selector">Excerpt selector (CSS)</label></th>
+                    <td>
+                        <input type="text" id="sci_excerpt_selector" name="excerpt_selector" class="regular-text" value="<?php echo esc_attr($values['excerpt_selector']); ?>" />
+                        <p class="description">Seletor relativo ao item para resumo/descrição curta.</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_image_selector">Image selector (CSS)</label></th>
+                    <td>
+                        <input type="text" id="sci_image_selector" name="image_selector" class="regular-text" value="<?php echo esc_attr($values['image_selector']); ?>" />
+                        <p class="description">Seletor relativo ao item para encontrar a capa (ex: <code>.post-thumbnail img</code>).</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_next_selector">Next page selector (CSS)</label></th>
+                    <td>
+                        <input type="text" id="sci_next_selector" name="next_page_selector" class="regular-text" value="<?php echo esc_attr($values['next_page_selector']); ?>" />
+                        <p class="description">Seletor CSS da âncora de próxima página (pagination). Opcional.</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_batch">Batch (max items por execução)</label></th>
+                    <td>
+                        <input type="number" id="sci_batch" name="batch" min="1" max="200" value="<?php echo esc_attr($values['batch']); ?>" />
+                        <p class="description">Quantidade máxima de itens importados nesta execução.</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_throttle">Throttle (ms entre requests)</label></th>
+                    <td>
+                        <input type="number" id="sci_throttle" name="throttle" min="0" max="10000" value="<?php echo esc_attr($values['throttle']); ?>" />
+                        <p class="description">Tempo em milissegundos entre requisições (reduce load). Padrão 500ms.</p>
+                    </td>
+                </tr>
+
+                <tr>
+                    <th scope="row"><label for="sci_dry_run">Dry run</label></th>
+                    <td>
+                        <label><input type="checkbox" id="sci_dry_run" name="dry_run" value="1" /> Executar sem inserir/baixar imagens (apenas relatório).</label>
+                    </td>
+                </tr>
+            </table>
+
+            <?php submit_button(__('Executar Importação (Dry-run recomendado)', 'sci')); ?>
+        </form>
+
+        <h2>Notas rápidas</h2>
+        <ul>
+            <li>Se você não souber os seletores, execute primeiro com <strong>dry-run</strong> e avalie o resumo retornado.</li>
+            <li>O plugin evita duplicados por <code>_sci_source_url</code> e por título.</li>
+            <li>Se você tiver acesso SSH, também pode usar o comando WP-CLI: <code>wp sci import --url="..." --batch=50</code></li>
+        </ul>
+    </div>
+    <?php
+}
+
+/**
+ * Admin post handler
+ */
+add_action('admin_post_sci_import_courses', 'sci_handle_import');
+function sci_handle_import() {
+    if (!current_user_can('manage_options')) {
+        wp_die(__('Você não tem permissão para executar isso.', 'sci'));
+    }
+
+    check_admin_referer('sci_import_courses_nonce', 'sci_import_courses_nonce');
+
+    $source_url = isset($_POST['sci_source_url']) ? esc_url_raw(wp_unslash($_POST['sci_source_url'])) : '';
+    $item_selector = isset($_POST['item_selector']) ? sanitize_text_field(wp_unslash($_POST['item_selector'])) : '.post';
+    $title_selector = isset($_POST['title_selector']) ? sanitize_text_field(wp_unslash($_POST['title_selector'])) : '.entry-title a';
+    $excerpt_selector = isset($_POST['excerpt_selector']) ? sanitize_text_field(wp_unslash($_POST['excerpt_selector'])) : '.entry-summary';
+    $image_selector = isset($_POST['image_selector']) ? sanitize_text_field(wp_unslash($_POST['image_selector'])) : '.post-thumbnail img';
+    $next_selector = isset($_POST['next_page_selector']) ? sanitize_text_field(wp_unslash($_POST['next_page_selector'])) : '';
+    $batch = isset($_POST['batch']) ? intval($_POST['batch']) : 20;
+    $throttle = isset($_POST['throttle']) ? intval($_POST['throttle']) : 500;
+    $dry_run = isset($_POST['dry_run']) ? true : false;
+
+    if (empty($source_url)) {
+        wp_safe_redirect(add_query_arg('sci_status', urlencode(__('Informe a URL da categoria.', 'sci')), admin_url('admin.php?page=sci-course-importer')));
+        exit;
+    }
+
+    $result = sci_import_from_category(array(
+        'start_url' => $source_url,
+        'item_selector' => $item_selector,
+        'title_selector' => $title_selector,
+        'excerpt_selector' => $excerpt_selector,
+        'image_selector' => $image_selector,
+        'next_selector' => $next_selector,
+        'batch' => $batch,
+        'throttle' => $throttle,
+        'dry_run' => $dry_run,
+    ));
+
+    $status = sprintf(__('Import completed: %d imported, %d skipped, %d errors. (dry_run=%s)', 'sci'), $result['imported'], $result['skipped'], $result['errors'], $dry_run ? 'true' : 'false');
+    wp_safe_redirect(add_query_arg('sci_status', urlencode($status), admin_url('admin.php?page=sci-course-importer')));
+    exit;
+}
+
+/**
+ * Main importer function
+ * Accepts options:
+ *  - start_url
+ *  - item_selector, title_selector, excerpt_selector, image_selector, next_selector
+ *  - batch, throttle(ms), dry_run
+ */
+function sci_import_from_category($opts = array()) {
+    $defaults = array(
+        'start_url' => '',
+        'item_selector' => '.post',
+        'title_selector' => '.entry-title a',
+        'excerpt_selector' => '.entry-summary',
+        'image_selector' => '.post-thumbnail img',
+        'next_selector' => '',
+        'batch' => 20,
+        'throttle' => 500,
+        'dry_run' => true,
+    );
+
+    $o = wp_parse_args($opts, $defaults);
+    $imported = 0;
+    $skipped = 0;
+    $errors = 0;
+    $visited_urls = array();
+
+    $url = $o['start_url'];
+    $items_processed = 0;
+
+    while (!empty($url) && $items_processed < $o['batch']) {
+        // fetch page
+        $res = wp_remote_get($url, array(
+            'timeout' => 30,
+            'headers' => array('User-Agent' => 'ScrapeCourseImporter/1.0'),
+        ));
+
+        if (is_wp_error($res)) {
+            $errors++;
+            break;
+        }
+
+        $status_code = wp_remote_retrieve_response_code($res);
+        if ($status_code !== 200) {
+            $errors++;
+            break;
+        }
+
+        $body = wp_remote_retrieve_body($res);
+        $dom = new DOMDocument();
+        libxml_use_internal_errors(true);
+        $loaded = $dom->loadHTML('<?xml encoding="utf-8" ?>' . $body);
+        libxml_clear_errors();
+        if (!$loaded) {
+            $errors++;
+            break;
+        }
+        $xpath = new DOMXPath($dom);
+
+        // convert CSS selector to XPath for item nodes
+        $item_xpath = sci_css_to_xpath($o['item_selector']);
+        if (!$item_xpath) {
+            // fallback: all article elements
+            $item_xpath = '//article';
+        }
+
+        $item_nodes = $xpath->query($item_xpath);
+        if (!$item_nodes || $item_nodes->length === 0) {
+            // no items found on this page
+        } else {
+            foreach ($item_nodes as $node) {
+                if ($items_processed >= $o['batch']) {
+                    break 2;
+                }
+
+                // extract title
+                $title = sci_extract_text_from_node($node, $o['title_selector'], $xpath);
+                $link = sci_extract_attr_from_node($node, $o['title_selector'], 'href', $xpath);
+                if (empty($link)) {
+                    // try generic a inside node
+                    $link = sci_extract_attr_from_node($node, 'a', 'href', $xpath);
+                }
+                $excerpt = sci_extract_html_from_node($node, $o['excerpt_selector'], $xpath);
+                $image = sci_extract_attr_from_node($node, $o['image_selector'], 'src', $xpath);
+                if (empty($image)) {
+                    // try data-src lazy attributes
+                    $image = sci_extract_attr_from_node($node, $o['image_selector'], 'data-src', $xpath);
+                    if (empty($image)) {
+                        $image = sci_extract_attr_from_node($node, $o['image_selector'], 'data-lazy-src', $xpath);
+                    }
+                }
+
+                // normalize link and image to absolute
+                if (!empty($link)) {
+                    $link = sci_make_absolute_url($link, $url);
+                }
+                if (!empty($image)) {
+                    $image = sci_make_absolute_url($image, $url);
+                }
+
+                // if no title, skip
+                if (empty($title)) {
+                    $skipped++;
+                    $items_processed++;
+                    continue;
+                }
+
+                // check duplicate by source url or title
+                $existing = false;
+                if (!empty($link)) {
+                    $existing = sci_find_existing_course_by_source($link);
+                }
+                if (!$existing) {
+                    $existing = sci_find_existing_course_by_title($title);
+                }
+
+                if ($existing) {
+                    $skipped++;
+                    $items_processed++;
+                    continue;
+                }
+
+                // dry run: count only
+                if ($o['dry_run']) {
+                    $imported++; // count as possible import
+                    $items_processed++;
+                    continue;
+                }
+
+                // create post
+                $postarr = array(
+                    'post_type' => 'course',
+                    'post_title' => wp_strip_all_tags($title),
+                    'post_content' => $excerpt ? $excerpt : '',
+                    'post_status' => 'publish',
+                );
+
+                $post_id = wp_insert_post($postarr, true);
+                if (is_wp_error($post_id) || !$post_id) {
+                    $errors++;
+                    $items_processed++;
+                    continue;
+                }
+
+                // save source url
+                if (!empty($link)) {
+                    update_post_meta($post_id, SCI_META_SOURCE_URL, esc_url_raw($link));
+                }
+
+                // attach image if present
+                if (!empty($image)) {
+                    $img_id = sci_download_and_attach_image($image, $post_id);
+                    if ($img_id) {
+                        set_post_thumbnail($post_id, $img_id);
+                    }
+                }
+
+                $imported++;
+                $items_processed++;
+
+                // throttle
+                if ($o['throttle'] > 0) {
+                    usleep(intval($o['throttle']) * 1000);
+                }
+            } // foreach nodes
+        }
+
+        // find next page
+        if (!empty($o['next_selector'])) {
+            $next_href = sci_extract_attr_global($o['next_selector'], 'href', $xpath);
+            if (!empty($next_href)) {
+                $next_url = sci_make_absolute_url($next_href, $url);
+                if (in_array($next_url, $visited_urls)) {
+                    $url = '';
+                } else {
+                    $visited_urls[] = $url;
+                    $url = $next_url;
+                }
+            } else {
+                $url = '';
+            }
+        } else {
+            // no next selector provided: stop after first page
+            $url = '';
+        }
+    } // while
+
+    return array('imported' => $imported, 'skipped' => $skipped, 'errors' => $errors);
+}
+
+/**
+ * Find existing course by source URL
+ */
+function sci_find_existing_course_by_source($source_url) {
+    if (empty($source_url)) {
+        return false;
+    }
+    $args = array(
+        'post_type' => 'course',
+        'meta_query' => array(
+            array(
+                'key' => SCI_META_SOURCE_URL,
+                'value' => $source_url,
+                'compare' => '=',
+            ),
+        ),
+        'posts_per_page' => 1,
+        'fields' => 'ids',
+    );
+    $q = new WP_Query($args);
+    if (!empty($q->posts)) {
+        return (int) $q->posts[0];
+    }
+    return false;
+}
+
+/**
+ * Find existing course by title
+ */
+function sci_find_existing_course_by_title($title) {
+    if (empty($title)) {
+        return false;
+    }
+    $q = new WP_Query(array(
+        'post_type' => 'course',
+        'title' => $title,
+        'posts_per_page' => 1,
+        'fields' => 'ids',
+    ));
+    if (!empty($q->posts)) {
+        return (int) $q->posts[0];
+    }
+    return false;
+}
+
+/**
+ * Download and attach image to post
+ */
+function sci_download_and_attach_image($image_url, $post_id = 0) {
+    if (!function_exists('media_handle_sideload')) {
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+    }
+
+    $tmp = download_url($image_url);
+    if (is_wp_error($tmp)) {
+        return 0;
+    }
+
+    $file = array(
+        'name' => basename(parse_url($image_url, PHP_URL_PATH)),
+        'tmp_name' => $tmp,
+    );
+
+    $id = media_handle_sideload($file, $post_id);
+    if (is_wp_error($id)) {
+        @unlink($tmp);
+        return 0;
+    }
+
+    return $id;
+}
+
+/**
+ * Extract visible text using a CSS selector (relative to node)
+ */
+function sci_extract_text_from_node($node, $css_selector, $xpath) {
+    if (empty($css_selector)) {
+        return trim($node->textContent);
+    }
+    $rel_xpath = sci_css_to_xpath($css_selector, true);
+    if (!$rel_xpath) {
+        return trim($node->textContent);
+    }
+    $res = $xpath->query($rel_xpath, $node);
+    if ($res && $res->length > 0) {
+        $texts = array();
+        foreach ($res as $n) {
+            $texts[] = trim($n->textContent);
+        }
+        return trim(implode(' ', $texts));
+    }
+    return '';
+}
+
+/**
+ * Extract inner HTML
+ */
+function sci_extract_html_from_node($node, $css_selector, $xpath) {
+    if (empty($css_selector)) {
+        return '';
+    }
+    $rel_xpath = sci_css_to_xpath($css_selector, true);
+    if (!$rel_xpath) {
+        return '';
+    }
+    $res = $xpath->query($rel_xpath, $node);
+    if ($res && $res->length > 0) {
+        $n = $res->item(0);
+        return sci_node_inner_html($n);
+    }
+    return '';
+}
+
+/**
+ * Extract attribute from node (relative)
+ */
+function sci_extract_attr_from_node($node, $css_selector, $attr, $xpath) {
+    if (empty($css_selector)) {
+        return '';
+    }
+    $rel_xpath = sci_css_to_xpath($css_selector, true);
+    if (!$rel_xpath) {
+        return '';
+    }
+    $res = $xpath->query($rel_xpath, $node);
+    if ($res && $res->length > 0) {
+        foreach ($res as $n) {
+            if ($n->hasAttribute($attr)) {
+                return $n->getAttribute($attr);
+            }
+            // if it's an <a>, maybe attribute is on href
+            if ($attr === 'href' && $n->nodeName === 'a' && $n->hasAttribute('href')) {
+                return $n->getAttribute('href');
+            }
+            // try img src child
+            if ($n->nodeName !== 'img') {
+                $imgs = $n->getElementsByTagName('img');
+                if ($imgs->length) {
+                    $img = $imgs->item(0);
+                    if ($img->hasAttribute('src')) {
+                        return $img->getAttribute('src');
+                    }
+                }
+            }
+        }
+    }
+    return '';
+}
+
+/**
+ * Extract global attr using a selector on whole document (not relative to item)
+ */
+function sci_extract_attr_global($css_selector, $attr, $xpath) {
+    $xp = sci_css_to_xpath($css_selector);
+    if (!$xp) {
+        return '';
+    }
+    $res = $xpath->query($xp);
+    if ($res && $res->length > 0) {
+        $n = $res->item(0);
+        if ($n->hasAttribute($attr)) {
+            return $n->getAttribute($attr);
+        }
+        if ($attr === 'href' && $n->nodeName === 'a' && $n->hasAttribute('href')) {
+            return $n->getAttribute('href');
+        }
+    }
+    return '';
+}
+
+/**
+ * Make absolute URL
+ */
+function sci_make_absolute_url($rel, $base) {
+    if (empty($rel)) {
+        return $rel;
+    }
+    // If already absolute
+    if (parse_url($rel, PHP_URL_SCHEME) !== null) {
+        return $rel;
+    }
+    // build absolute
+    $base_parts = parse_url($base);
+    if (!$base_parts) {
+        return $rel;
+    }
+    $scheme = isset($base_parts['scheme']) ? $base_parts['scheme'] : 'http';
+    $host = isset($base_parts['host']) ? $base_parts['host'] : '';
+    if (strpos($rel, '//') === 0) {
+        return $scheme . ':' . $rel;
+    }
+    if ($rel[0] === '/') {
+        return $scheme . '://' . $host . $rel;
+    }
+    // relative path
+    $path = isset($base_parts['path']) ? $base_parts['path'] : '/';
+    $dir = rtrim(dirname($path), '/\\');
+    return $scheme . '://' . $host . $dir . '/' . ltrim($rel, '/');
+}
+
+/**
+ * Convert a very small subset of CSS selectors to XPath
+ * Supports tokens separated by spaces (descendant):
+ *  - tag
+ *  - .class
+ *  - #id
+ *  - tag.class
+ *  - tag#id
+ *
+ * If $relative is true, prefix '.' to each returned xpath (for query relative to context node)
+ */
+function sci_css_to_xpath($selector, $relative = false) {
+    $selector = trim($selector);
+    if (empty($selector)) {
+        return '';
+    }
+    // split on commas: take first for simplicity
+    $selector = explode(',', $selector)[0];
+    $tokens = preg_split('/\s+/', trim($selector));
+    $parts = array();
+    foreach ($tokens as $token) {
+        $tag = '*';
+        $class = '';
+        $id = '';
+
+        // tag.class or tag#id
+        if (preg_match('/^([a-zA-Z0-9_-]+)([.#].+)?$/', $token, $m)) {
+            $tag = $m[1];
+            $rest = isset($m[2]) ? $m[2] : '';
+            if ($rest) {
+                if (strpos($rest, '.') !== false) {
+                    $class = str_replace('.', '', $rest);
+                } elseif (strpos($rest, '#') !== false) {
+                    $id = str_replace('#', '', $rest);
+                }
+            }
+        } else {
+            if ($token[0] === '.') {
+                $class = substr($token, 1);
+            } elseif ($token[0] === '#') {
+                $id = substr($token, 1);
+            } else {
+                $tag = $token;
+            }
+        }
+
+        $seg = $tag;
+        $conds = array();
+        if (!empty($id)) {
+            $conds[] = '@id=' . "'" . $id . "'";
+        }
+        if (!empty($class)) {
+            // contains class
+            $conds[] = "contains(concat(' ', normalize-space(@class), ' '), ' " . $class . " ')";
+        }
+        if (!empty($conds)) {
+            $seg .= '[' . implode(' and ', $conds) . ']';
+        }
+        $parts[] = $seg;
+    }
+
+    if (empty($parts)) {
+        return '';
+    }
+
+    // Build descendant xpath
+    $xpath = '//' . implode('//', $parts);
+    if ($relative) {
+        // make it relative to current node
+        if (strpos($xpath, '//') === 0) {
+            $xpath = '.' . substr($xpath, 1);
+        } else {
+            $xpath = '.' . $xpath;
+        }
+    }
+    return $xpath;
+}
+
+/**
+ * Inner HTML helper
+ */
+function sci_node_inner_html($node) {
+    $doc = $node->ownerDocument;
+    $html = '';
+    foreach ($node->childNodes as $child) {
+        $html .= $doc->saveHTML($child);
+    }
+    return $html;
+}
+
+/**
+ * WP-CLI command registration (if WP-CLI available)
+ */
+if (defined('WP_CLI') && WP_CLI) {
+    WP_CLI::add_command('sci import', function($args, $assoc_args) {
+        $url = isset($assoc_args['url']) ? $assoc_args['url'] : (isset($args[0]) ? $args[0] : '');
+        if (empty($url)) {
+            WP_CLI::error('Informe a URL: wp sci import --url="https://..."');
+            return;
+        }
+        $options = array(
+            'start_url' => $url,
+            'item_selector' => isset($assoc_args['item_selector']) ? $assoc_args['item_selector'] : '.post',
+            'title_selector' => isset($assoc_args['title_selector']) ? $assoc_args['title_selector'] : '.entry-title a',
+            'excerpt_selector' => isset($assoc_args['excerpt_selector']) ? $assoc_args['excerpt_selector'] : '.entry-summary',
+            'image_selector' => isset($assoc_args['image_selector']) ? $assoc_args['image_selector'] : '.post-thumbnail img',
+            'next_selector' => isset($assoc_args['next_selector']) ? $assoc_args['next_selector'] : '',
+            'batch' => isset($assoc_args['batch']) ? intval($assoc_args['batch']) : 50,
+            'throttle' => isset($assoc_args['throttle']) ? intval($assoc_args['throttle']) : 500,
+            'dry_run' => isset($assoc_args['dry_run']) ? true : false,
+        );
+        WP_CLI::log('Starting import from ' . $url);
+        $res = sci_import_from_category($options);
+        WP_CLI::success('Done: imported=' . $res['imported'] . ' skipped=' . $res['skipped'] . ' errors=' . $res['errors']);
+    });
+}
+
+?>
